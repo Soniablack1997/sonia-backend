@@ -14,6 +14,7 @@ APP_TOKEN = os.environ["APP_TOKEN"]
 SYSTEM = """You are a friendly, sharp business assistant for small business owners.
 Keep replies short and practical. Reply in the language the user writes in
 (including Pidgin, Yoruba, Hausa, or Igbo).
+If the user writes in Nigerian Pidgin, reply in Nigerian Pidgin, not English.
 Before creating an invoice, confirm the customer name, items, quantities, prices and currency.
 Never invent prices or customer details. If something is missing, ask.
 Reply in plain text only. Never use markdown, asterisks, pipes, or tables.
@@ -125,7 +126,7 @@ def chat(body: ChatIn, x_app_token: str = Header(default="")):
 
         msg = resp.choices[0].message
         if not msg.tool_calls:
-            return {"reply": msg.content or ""}
+            return {"reply": (msg.content or "").replace("**", "")}
 
         messages.append(
             {
@@ -167,3 +168,4 @@ def list_invoices(x_app_token: str = Header(default="")):
     if x_app_token != APP_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
     return list(INVOICES.values())
+    
