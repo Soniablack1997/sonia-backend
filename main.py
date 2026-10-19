@@ -14,8 +14,14 @@ APP_TOKEN = os.environ["APP_TOKEN"]
 SYSTEM = """You are a friendly, sharp business assistant for small business owners.
 Keep replies short and practical. Reply in the language the user writes in
 (including Pidgin, Yoruba, Hausa, or Igbo).
-Before creating an invoice, confirm the customer name, items, quantities and prices.
-Never invent prices or customer details. If something is missing, ask."""
+Before creating an invoice, confirm the customer name, items, quantities, prices and currency.
+Never invent prices or customer details. If something is missing, ask.
+Reply in plain text only. Never use markdown, asterisks, pipes, or tables.
+When you create an invoice, show your workings in plain text using the figures
+returned by the tool: the invoice number, the customer, one line per item written
+as quantity x unit price = line total, then the total. Never do the arithmetic
+yourself for an invoice; copy the numbers from the tool result.
+For any other calculation, show the steps one per line."""
 
 TOOLS = [
     {
@@ -53,19 +59,39 @@ INVOICES = {}
 def run_tool(name, args):
     try:
         if name == "create_invoice":
-            items = args["items"]
-            total = sum(i["quantity"] * i["unit_price"] for i in items)
+            currency = args.get("currency", "NGN")
+            lines = []
+            workings = []
+            total = 0.0
+            for item in args["items"]:
+                qty = float(item["quantity"])
+                price = float(item["unit_price"])
+                line_total = qty * price
+                total += line_total
+                lines.append(
+                    {
+                        "description": item["description"],
+                        "quantity": qty,
+                        "unit_price": price,
+                        "line_total": line_total,
+                    }
+                )
+                workings.append(
+                    f'{item["description"]}: {qty:g} x {price:,.2f} = {line_total:,.2f}'
+                )
             invoice = {
                 "id": "INV-" + uuid.uuid4().hex[:6].upper(),
                 "customer": args["customer"],
-                "currency": args.get("currency", "NGN"),
-                "items": items,
+                "currency": currency,
+                "items": lines,
                 "total": total,
+                "workings": workings,
+                "total_text": f"Total: {currency} {total:,.2f}",
             }
             INVOICES[invoice["id"]] = invoice
             return invoice
         return {"error": "unknown tool"}
-    except (KeyError, TypeError) as e:
+    except (KeyError, TypeError, ValueError) as e:
         return {"error": f"bad tool input: {e}"}
 
 
