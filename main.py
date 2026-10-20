@@ -2,14 +2,17 @@ import json
 import os
 import uuid
 
+import psycopg
 from fastapi import FastAPI, Header, HTTPException
 from groq import Groq
+from psycopg.types.json import Jsonb
 from pydantic import BaseModel
 
 app = FastAPI()
 client = Groq()  # reads GROQ_API_KEY from the environment
 MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 APP_TOKEN = os.environ["APP_TOKEN"]
+DATABASE_URL = os.environ.get("DATABASE_URL")  # Neon connection string
 
 SYSTEM = """You are a friendly, sharp business assistant for small business owners.
 Keep replies short and practical. Reply in the language the user writes in
@@ -22,6 +25,7 @@ When you create an invoice, show your workings in plain text using the figures
 returned by the tool: the invoice number, the customer, one line per item written
 as quantity x unit price = line total, then the total. Never do the arithmetic
 yourself for an invoice; copy the numbers from the tool result.
+If the tool returns an error, tell the user the invoice was NOT saved and ask them to try again.
 For any other calculation, show the steps one per line."""
 
 TOOLS = [
@@ -54,7 +58,51 @@ TOOLS = [
     }
 ]
 
+# Used only if DATABASE_URL is not set (invoices then vanish on restart).
 INVOICES = {}
+_table_ready = False
+
+
+def db():
+    # prepare_threshold=None keeps this safe with Neon's connection pooler.
+    return psycopg.connect(DATABASE_URL, prepare_threshold=None, connect_timeout=10)
+
+
+def ensure_table():
+    global _table_ready
+    if _table_ready or not DATABASE_URL:
+        return
+    with db() as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS invoices ("
+            "id TEXT PRIMARY KEY, "
+            "data JSONB NOT NULL, "
+            "created_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+        )
+    _table_ready = True
+
+
+def save_invoice(invoice):
+    if DATABASE_URL:
+        ensure_table()
+        with db() as conn:
+            conn.execute(
+                "INSERT INTO invoices (id, data) VALUES (%s, %s)",
+                (invoice["id"], Jsonb(invoice)),
+            )
+    else:
+        INVOICES[invoice["id"]] = invoice
+
+
+def load_invoices():
+    if DATABASE_URL:
+        ensure_table()
+        with db() as conn:
+            rows = conn.execute(
+                "SELECT data FROM invoices ORDER BY created_at DESC LIMIT 100"
+            ).fetchall()
+        return [r[0] for r in rows]
+    return list(INVOICES.values())
 
 
 def run_tool(name, args):
@@ -81,7 +129,7 @@ def run_tool(name, args):
                     f'{item["description"]}: {qty:g} x {price:,.2f} = {line_total:,.2f}'
                 )
             invoice = {
-                "id": "INV-" + uuid.uuid4().hex[:6].upper(),
+                "id": "INV-" + uuid.uuid4().hex[:8].upper(),
                 "customer": args["customer"],
                 "currency": currency,
                 "items": lines,
@@ -89,11 +137,14 @@ def run_tool(name, args):
                 "workings": workings,
                 "total_text": f"Total: {currency} {total:,.2f}",
             }
-            INVOICES[invoice["id"]] = invoice
+            save_invoice(invoice)
             return invoice
         return {"error": "unknown tool"}
     except (KeyError, TypeError, ValueError) as e:
         return {"error": f"bad tool input: {e}"}
+    except psycopg.Error as e:
+        print("Database error:", e)
+        return {"error": "could not save the invoice, please try again"}
 
 
 class Msg(BaseModel):
@@ -103,6 +154,11 @@ class Msg(BaseModel):
 
 class ChatIn(BaseModel):
     messages: list[Msg]
+
+
+@app.get("/")
+def health():
+    return {"status": "ok"}
 
 
 @app.post("/chat")
@@ -167,5 +223,8 @@ def chat(body: ChatIn, x_app_token: str = Header(default="")):
 def list_invoices(x_app_token: str = Header(default="")):
     if x_app_token != APP_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
-    return list(INVOICES.values())
-    
+    try:
+        return load_invoices()
+    except psycopg.Error as e:
+        print("Database error:", e)
+        raise HTTPException(status_code=503, detail="Database unavailable")
