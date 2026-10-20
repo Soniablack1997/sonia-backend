@@ -24,9 +24,10 @@ Keep replies short and practical. Reply in the language the user writes in
 If the user writes in Nigerian Pidgin, reply in Nigerian Pidgin, not English.
 
 What you can do: create invoices, do calculations, remember facts about the user,
-and prepare phone actions (set an alarm, start a timer, add a calendar event).
+and prepare phone actions (set an alarm, start a timer, add a calendar event,
+draft an SMS, open the phone dialer, draft a WhatsApp message).
 You cannot do anything else
-yet, so never offer other things such as expense tracking, calls or messages.
+yet, so never offer other things such as expense tracking or reading contacts.
 
 Invoices: before creating one, confirm the customer name, items, quantities, prices
 and currency. Never invent prices or customer details. If something is missing, ask.
@@ -41,6 +42,11 @@ calling one, say something short like "Tap Confirm to set it". Never say it is
 already done. Use these tools only when the user asks. For a time of day use set_alarm,
 for a countdown use set_timer, for a specific date and time use add_calendar_event.
 Work out dates from the current date and time given below.
+Messages and calls: you cannot read the user's contacts, so you need the phone number
+from the user (or from remembered facts). Never guess a number. Nothing is sent or
+called until the user taps Confirm and then sends or dials it themselves. Write the
+message text yourself in the user's wording, then use draft_sms or whatsapp_message.
+Use call_number to open the dialer.
 
 Memory: when the user tells you something worth keeping (their name, business, usual
 currency, customers, prices, preferences) or says "remember", call remember with one
@@ -126,6 +132,48 @@ TOOLS = [
                     "description": {"type": "string"},
                 },
                 "required": ["title", "start"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "draft_sms",
+            "description": "Prepare an SMS draft. The user must tap Confirm and then send it themselves.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "phone": {"type": "string", "description": "Number, with country code if known"},
+                    "message": {"type": "string"},
+                },
+                "required": ["phone", "message"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "whatsapp_message",
+            "description": "Prepare a WhatsApp message draft. The user must tap Confirm and then send it themselves.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "phone": {"type": "string", "description": "Number, with country code if known"},
+                    "message": {"type": "string"},
+                },
+                "required": ["phone", "message"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "call_number",
+            "description": "Open the phone dialer with a number filled in. The user must tap Confirm and then dial.",
+            "parameters": {
+                "type": "object",
+                "properties": {"phone": {"type": "string"}},
+                "required": ["phone"],
             },
         },
     },
@@ -240,6 +288,23 @@ def delete_memories(keyword):
     before = len(MEMORIES)
     MEMORIES[:] = [m for m in MEMORIES if keyword.lower() not in m.lower()]
     return before - len(MEMORIES)
+
+
+def normalize_phone(raw):
+    """Return digits with a leading + , or None if it doesn't look like a number."""
+    text = str(raw or "").strip()
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if text.startswith("00"):
+        digits = digits[2:]
+        text = "+" + digits
+    if not text.startswith("+"):
+        if digits.startswith("0") and len(digits) == 11:
+            digits = "234" + digits[1:]  # Nigerian local format
+        elif len(digits) == 10 and digits[0] in "789":
+            digits = "234" + digits
+    if not (8 <= len(digits) <= 15):
+        return None
+    return "+" + digits
 
 
 def clean_label(value):
@@ -357,6 +422,29 @@ def run_tool(name, args, actions):
             )
             return {"status": "waiting for the user to tap Confirm on their phone"}
 
+        if name in ("draft_sms", "whatsapp_message", "call_number"):
+            phone = normalize_phone(args.get("phone"))
+            if not phone:
+                return {"error": "that phone number looks invalid; ask the user for it"}
+            if name == "call_number":
+                actions.append(
+                    {"type": "call_number", "phone": phone, "summary": f"Open dialer for {phone}"}
+                )
+            else:
+                message = str(args.get("message") or "").strip()[:1000]
+                if not message:
+                    return {"error": "message is required"}
+                kind = "SMS" if name == "draft_sms" else "WhatsApp message"
+                actions.append(
+                    {
+                        "type": name,
+                        "phone": phone,
+                        "message": message,
+                        "summary": f"Draft {kind} to {phone}: {message[:80]}",
+                    }
+                )
+            return {"status": "waiting for the user to tap Confirm and send it themselves"}
+
         if name == "remember":
             fact = str(args["fact"]).strip()[:300]
             if not fact:
@@ -465,22 +553,4 @@ def chat(body: ChatIn, x_app_token: str = Header(default="")):
 
 @app.get("/memories")
 def list_memories(x_app_token: str = Header(default="")):
-    if x_app_token != APP_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    try:
-        return load_memories()
-    except psycopg.Error as e:
-        print("Database error:", e)
-        raise HTTPException(status_code=503, detail="Database unavailable")
-
-
-@app.get("/invoices")
-def list_invoices(x_app_token: str = Header(default="")):
-    if x_app_token != APP_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    try:
-        return load_invoices()
-    except psycopg.Error as e:
-        print("Database error:", e)
-        raise HTTPException(status_code=503, detail="Database unavailable")
-                            
+   
