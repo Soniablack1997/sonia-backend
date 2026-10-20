@@ -23,8 +23,9 @@ Keep replies short and practical. Reply in the language the user writes in
 (including Pidgin, Yoruba, Hausa, or Igbo).
 If the user writes in Nigerian Pidgin, reply in Nigerian Pidgin, not English.
 
-What you can do: create invoices, do calculations, and prepare phone actions
-(set an alarm, start a timer, add a calendar event). You cannot do anything else
+What you can do: create invoices, do calculations, remember facts about the user,
+and prepare phone actions (set an alarm, start a timer, add a calendar event).
+You cannot do anything else
 yet, so never offer other things such as expense tracking, calls or messages.
 
 Invoices: before creating one, confirm the customer name, items, quantities, prices
@@ -40,6 +41,11 @@ calling one, say something short like "Tap Confirm to set it". Never say it is
 already done. Use these tools only when the user asks. For a time of day use set_alarm,
 for a countdown use set_timer, for a specific date and time use add_calendar_event.
 Work out dates from the current date and time given below.
+
+Memory: when the user tells you something worth keeping (their name, business, usual
+currency, customers, prices, preferences) or says "remember", call remember with one
+short fact. When they ask you to forget something, call forget with a keyword.
+Use the remembered facts below naturally. Never invent facts about the user.
 
 Reply in plain text only. Never use markdown, asterisks, pipes, or tables.
 For any other calculation, show the steps one per line."""
@@ -123,10 +129,35 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "remember",
+            "description": "Save one short fact about the user for future chats.",
+            "parameters": {
+                "type": "object",
+                "properties": {"fact": {"type": "string"}},
+                "required": ["fact"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "forget",
+            "description": "Delete saved facts that contain a keyword.",
+            "parameters": {
+                "type": "object",
+                "properties": {"keyword": {"type": "string"}},
+                "required": ["keyword"],
+            },
+        },
+    },
 ]
 
 # Used only if DATABASE_URL is not set (invoices then vanish on restart).
 INVOICES = {}
+MEMORIES = []
 _table_ready = False
 
 
@@ -144,6 +175,12 @@ def ensure_table():
             "CREATE TABLE IF NOT EXISTS invoices ("
             "id TEXT PRIMARY KEY, "
             "data JSONB NOT NULL, "
+            "created_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS memories ("
+            "id SERIAL PRIMARY KEY, "
+            "fact TEXT NOT NULL, "
             "created_at TIMESTAMPTZ NOT NULL DEFAULT now())"
         )
     _table_ready = True
@@ -170,6 +207,39 @@ def load_invoices():
             ).fetchall()
         return [r[0] for r in rows]
     return list(INVOICES.values())
+
+
+def save_memory(fact):
+    if DATABASE_URL:
+        ensure_table()
+        with db() as conn:
+            conn.execute("INSERT INTO memories (fact) VALUES (%s)", (fact,))
+    else:
+        MEMORIES.append(fact)
+
+
+def load_memories():
+    if DATABASE_URL:
+        ensure_table()
+        with db() as conn:
+            rows = conn.execute(
+                "SELECT fact FROM memories ORDER BY created_at DESC LIMIT 50"
+            ).fetchall()
+        return [r[0] for r in rows]
+    return list(reversed(MEMORIES))
+
+
+def delete_memories(keyword):
+    if DATABASE_URL:
+        ensure_table()
+        with db() as conn:
+            cur = conn.execute(
+                "DELETE FROM memories WHERE fact ILIKE %s", (f"%{keyword}%",)
+            )
+            return cur.rowcount
+    before = len(MEMORIES)
+    MEMORIES[:] = [m for m in MEMORIES if keyword.lower() not in m.lower()]
+    return before - len(MEMORIES)
 
 
 def clean_label(value):
@@ -287,12 +357,25 @@ def run_tool(name, args, actions):
             )
             return {"status": "waiting for the user to tap Confirm on their phone"}
 
+        if name == "remember":
+            fact = str(args["fact"]).strip()[:300]
+            if not fact:
+                return {"error": "fact is required"}
+            save_memory(fact)
+            return {"status": "saved", "fact": fact}
+
+        if name == "forget":
+            keyword = str(args["keyword"]).strip()
+            if len(keyword) < 2:
+                return {"error": "keyword is too short"}
+            return {"status": "deleted", "count": delete_memories(keyword)}
+
         return {"error": "unknown tool"}
     except (KeyError, TypeError, ValueError) as e:
         return {"error": f"bad tool input: {e}"}
     except psycopg.Error as e:
         print("Database error:", e)
-        return {"error": "could not save the invoice, please try again"}
+        return {"error": "could not save or load that, please try again"}
 
 
 class Msg(BaseModel):
@@ -316,6 +399,13 @@ def chat(body: ChatIn, x_app_token: str = Header(default="")):
 
     now = datetime.now(TZ)
     system = SYSTEM_BASE + f"\n\nCurrent date and time in Lagos: {now:%A, %d %B %Y, %H:%M}."
+    try:
+        facts = load_memories()
+    except psycopg.Error as e:
+        print("Database error:", e)
+        facts = []
+    if facts:
+        system += "\n\nWhat you remember about the user:\n" + "\n".join("- " + f for f in facts)
     messages = [{"role": "system", "content": system}]
     messages += [m.model_dump() for m in body.messages]
     actions = []
@@ -373,6 +463,17 @@ def chat(body: ChatIn, x_app_token: str = Header(default="")):
     return {"reply": "Sorry, that took too many steps. Please try again.", "actions": []}
 
 
+@app.get("/memories")
+def list_memories(x_app_token: str = Header(default="")):
+    if x_app_token != APP_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    try:
+        return load_memories()
+    except psycopg.Error as e:
+        print("Database error:", e)
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+
 @app.get("/invoices")
 def list_invoices(x_app_token: str = Header(default="")):
     if x_app_token != APP_TOKEN:
@@ -382,3 +483,4 @@ def list_invoices(x_app_token: str = Header(default="")):
     except psycopg.Error as e:
         print("Database error:", e)
         raise HTTPException(status_code=503, detail="Database unavailable")
+                            
