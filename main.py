@@ -1,8 +1,7 @@
 import json
 import os
-import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import psycopg
 from fastapi import FastAPI, Header, HTTPException
@@ -16,30 +15,33 @@ MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 APP_TOKEN = os.environ["APP_TOKEN"]
 DATABASE_URL = os.environ.get("DATABASE_URL")  # Neon connection string
 
-SYSTEM = """You are Sonia, a friendly, sharp assistant for small business owners.
+# Lagos is UTC+1 all year (no daylight saving).
+TZ = timezone(timedelta(hours=1))
+
+SYSTEM_BASE = """You are Sonia, a friendly, sharp assistant for small business owners.
 Keep replies short and practical. Reply in the language the user writes in
 (including Pidgin, Yoruba, Hausa, or Igbo).
 If the user writes in Nigerian Pidgin, reply in Nigerian Pidgin, not English.
 
-What you can do right now:
-1. Create and save invoices.
-2. Prepare phone actions: set an alarm, start a timer, add a calendar event,
-   open the dialer with a number, or draft a text message. For these you only
-   PREPARE the action. The user must tap Confirm on their phone, and for calls and
-   texts they still press call or send themselves. Never say a phone action is done;
-   say you have prepared it and ask them to tap Confirm.
-You cannot do anything else yet. Do not offer other features such as expense
-tracking, sending messages by yourself, or payments. If asked, say it is not
-available yet.
+What you can do: create invoices, do calculations, and prepare phone actions
+(set an alarm, start a timer, add a calendar event). You cannot do anything else
+yet, so never offer other things such as expense tracking, calls or messages.
 
-Before creating an invoice, confirm the customer name, items, quantities, prices and currency.
-Never invent prices, phone numbers or customer details. If something is missing, ask.
+Invoices: before creating one, confirm the customer name, items, quantities, prices
+and currency. Never invent prices or customer details. If something is missing, ask.
+When you create an invoice, show your workings using the figures returned by the tool:
+the invoice number, the customer, one line per item written as
+quantity x unit price = line total, then the total. Never do invoice arithmetic
+yourself; copy the numbers from the tool result.
+If the tool returns an error, tell the user the invoice was NOT saved.
+
+Phone actions: they are NOT done until the user taps Confirm on their phone. After
+calling one, say something short like "Tap Confirm to set it". Never say it is
+already done. Use these tools only when the user asks. For a time of day use set_alarm,
+for a countdown use set_timer, for a specific date and time use add_calendar_event.
+Work out dates from the current date and time given below.
+
 Reply in plain text only. Never use markdown, asterisks, pipes, or tables.
-When you create an invoice, show your workings in plain text using the figures
-returned by the tool: the invoice number, the customer, one line per item written
-as quantity x unit price = line total, then the total. Never do the arithmetic
-yourself for an invoice; copy the numbers from the tool result.
-If a tool returns an error, tell the user it did not work and why, in simple words.
 For any other calculation, show the steps one per line."""
 
 TOOLS = [
@@ -74,11 +76,11 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "set_alarm",
-            "description": "Prepare an alarm on the user's phone at a clock time (24-hour).",
+            "description": "Prepare an alarm at a time of day on the user's phone. The user must tap Confirm.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "hour": {"type": "integer", "description": "0-23"},
+                    "hour": {"type": "integer", "description": "0-23, 24-hour clock"},
                     "minute": {"type": "integer", "description": "0-59"},
                     "label": {"type": "string"},
                 },
@@ -90,11 +92,11 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "set_timer",
-            "description": "Prepare a countdown timer on the user's phone.",
+            "description": "Prepare a countdown timer on the user's phone. The user must tap Confirm.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "seconds": {"type": "integer", "description": "1 to 86400"},
+                    "seconds": {"type": "integer", "description": "Length in seconds, 1 to 86400"},
                     "label": {"type": "string"},
                 },
                 "required": ["seconds"],
@@ -105,55 +107,23 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "add_calendar_event",
-            "description": "Prepare a calendar event on the user's phone. Times are the user's local time.",
+            "description": "Prepare a calendar event or reminder for a specific date and time. The user must tap Confirm.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "title": {"type": "string"},
-                    "start": {"type": "string", "description": "YYYY-MM-DDTHH:MM, e.g. 2026-10-21T09:00"},
-                    "end": {"type": "string", "description": "YYYY-MM-DDTHH:MM, optional"},
-                    "location": {"type": "string"},
-                    "notes": {"type": "string"},
+                    "start": {
+                        "type": "string",
+                        "description": "Local Lagos time as ISO 8601, e.g. 2026-10-21T09:00",
+                    },
+                    "duration_minutes": {"type": "integer", "description": "Default 60"},
+                    "description": {"type": "string"},
                 },
                 "required": ["title", "start"],
             },
         },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "dial_number",
-            "description": "Prepare a phone call by opening the dialer with the number filled in.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "phone_number": {"type": "string"},
-                    "label": {"type": "string", "description": "who is being called"},
-                },
-                "required": ["phone_number"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "draft_sms",
-            "description": "Prepare a text message by opening the messaging app with the text filled in.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "phone_number": {"type": "string"},
-                    "message": {"type": "string"},
-                },
-                "required": ["phone_number", "message"],
-            },
-        },
-    },
 ]
-
-DEVICE_TOOLS = {"set_alarm", "set_timer", "add_calendar_event", "dial_number", "draft_sms"}
-PHONE_RE = re.compile(r"^\+?[0-9 ()\-]{5,20}$")
-TIME_FMT = "%Y-%m-%dT%H:%M"
 
 # Used only if DATABASE_URL is not set (invoices then vanish on restart).
 INVOICES = {}
@@ -202,7 +172,24 @@ def load_invoices():
     return list(INVOICES.values())
 
 
-def run_tool(name, args):
+def clean_label(value):
+    return str(value or "").strip()[:80]
+
+
+def fmt_duration(total):
+    hours, rest = divmod(total, 3600)
+    minutes, seconds = divmod(rest, 60)
+    parts = []
+    if hours:
+        parts.append(f"{hours} h")
+    if minutes:
+        parts.append(f"{minutes} min")
+    if seconds:
+        parts.append(f"{seconds} s")
+    return " ".join(parts)
+
+
+def run_tool(name, args, actions):
     try:
         if name == "create_invoice":
             currency = args.get("currency", "NGN")
@@ -236,78 +223,76 @@ def run_tool(name, args):
             }
             save_invoice(invoice)
             return invoice
+
+        if name == "set_alarm":
+            hour = int(args["hour"])
+            minute = int(args.get("minute", 0))
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                return {"error": "hour must be 0-23 and minute 0-59"}
+            label = clean_label(args.get("label"))
+            summary = f"Set alarm for {hour:02d}:{minute:02d}"
+            if label:
+                summary += f" - {label}"
+            actions.append(
+                {
+                    "type": "set_alarm",
+                    "hour": hour,
+                    "minute": minute,
+                    "label": label,
+                    "summary": summary,
+                }
+            )
+            return {"status": "waiting for the user to tap Confirm on their phone"}
+
+        if name == "set_timer":
+            seconds = int(args["seconds"])
+            if not (1 <= seconds <= 86400):
+                return {"error": "seconds must be between 1 and 86400"}
+            label = clean_label(args.get("label"))
+            summary = f"Start timer for {fmt_duration(seconds)}"
+            if label:
+                summary += f" - {label}"
+            actions.append(
+                {
+                    "type": "set_timer",
+                    "seconds": seconds,
+                    "label": label,
+                    "summary": summary,
+                }
+            )
+            return {"status": "waiting for the user to tap Confirm on their phone"}
+
+        if name == "add_calendar_event":
+            title = clean_label(args["title"])
+            if not title:
+                return {"error": "title is required"}
+            start = datetime.fromisoformat(str(args["start"]))
+            if start.tzinfo is None:
+                start = start.replace(tzinfo=TZ)
+            if start < datetime.now(TZ) - timedelta(minutes=1):
+                return {"error": "that time is in the past; check the date and year"}
+            duration = int(args.get("duration_minutes") or 60)
+            if not (5 <= duration <= 1440):
+                return {"error": "duration_minutes must be between 5 and 1440"}
+            end = start + timedelta(minutes=duration)
+            actions.append(
+                {
+                    "type": "add_calendar_event",
+                    "title": title,
+                    "description": str(args.get("description") or "")[:300],
+                    "start_ms": int(start.timestamp() * 1000),
+                    "end_ms": int(end.timestamp() * 1000),
+                    "summary": f"Add to calendar: {title} on {start:%a %d %b, %H:%M}",
+                }
+            )
+            return {"status": "waiting for the user to tap Confirm on their phone"}
+
         return {"error": "unknown tool"}
     except (KeyError, TypeError, ValueError) as e:
         return {"error": f"bad tool input: {e}"}
     except psycopg.Error as e:
         print("Database error:", e)
         return {"error": "could not save the invoice, please try again"}
-
-
-def prepare_device_action(name, args):
-    """Validate a phone action. Returns (action, error). The app runs it after the user confirms."""
-    try:
-        if name == "set_alarm":
-            hour, minute = int(args["hour"]), int(args["minute"])
-            if not (0 <= hour <= 23 and 0 <= minute <= 59):
-                return None, {"error": "hour must be 0-23 and minute 0-59"}
-            label = str(args.get("label", "")).strip()
-            summary = f"Set alarm for {hour:02d}:{minute:02d}" + (f" ({label})" if label else "")
-            return {"name": name, "summary": summary,
-                    "args": {"hour": hour, "minute": minute, "label": label}}, None
-
-        if name == "set_timer":
-            seconds = int(args["seconds"])
-            if not (1 <= seconds <= 86400):
-                return None, {"error": "seconds must be between 1 and 86400"}
-            label = str(args.get("label", "")).strip()
-            mins, secs = divmod(seconds, 60)
-            hrs, mins = divmod(mins, 60)
-            parts = [f"{hrs}h" if hrs else "", f"{mins}m" if mins else "", f"{secs}s" if secs else ""]
-            summary = "Start timer for " + " ".join(p for p in parts if p) + (f" ({label})" if label else "")
-            return {"name": name, "summary": summary,
-                    "args": {"seconds": seconds, "label": label}}, None
-
-        if name == "add_calendar_event":
-            title = str(args["title"]).strip()
-            if not title:
-                return None, {"error": "title is empty"}
-            start = datetime.strptime(str(args["start"]), TIME_FMT)
-            end_raw = str(args.get("end", "")).strip()
-            end = datetime.strptime(end_raw, TIME_FMT) if end_raw else None
-            if end and end <= start:
-                return None, {"error": "end must be after start"}
-            when = start.strftime("%a %d %b %Y at %H:%M")
-            summary = f"Add to calendar: {title}, {when}"
-            return {"name": name, "summary": summary,
-                    "args": {"title": title,
-                             "start": start.strftime(TIME_FMT),
-                             "end": end.strftime(TIME_FMT) if end else "",
-                             "location": str(args.get("location", "")).strip(),
-                             "notes": str(args.get("notes", "")).strip()}}, None
-
-        if name == "dial_number":
-            phone = str(args["phone_number"]).strip()
-            if not PHONE_RE.match(phone):
-                return None, {"error": "that does not look like a phone number"}
-            label = str(args.get("label", "")).strip()
-            summary = f"Open dialer: {phone}" + (f" ({label})" if label else "")
-            return {"name": name, "summary": summary,
-                    "args": {"phone_number": phone, "label": label}}, None
-
-        if name == "draft_sms":
-            phone = str(args["phone_number"]).strip()
-            message = str(args["message"]).strip()
-            if not PHONE_RE.match(phone):
-                return None, {"error": "that does not look like a phone number"}
-            if not message:
-                return None, {"error": "message is empty"}
-            summary = f'Draft text to {phone}: "{message}"'
-            return {"name": name, "summary": summary,
-                    "args": {"phone_number": phone, "message": message}}, None
-    except (KeyError, TypeError, ValueError) as e:
-        return None, {"error": f"bad input: {e}"}
-    return None, {"error": "unknown tool"}
 
 
 class Msg(BaseModel):
@@ -317,20 +302,6 @@ class Msg(BaseModel):
 
 class ChatIn(BaseModel):
     messages: list[Msg]
-    now: str = ""        # the phone's local date and time
-    timezone: str = ""   # the phone's timezone name
-
-
-def build_system(now, timezone):
-    if not now:
-        return SYSTEM
-    tz = f" (timezone {timezone})" if timezone else ""
-    return (
-        SYSTEM
-        + f"\n\nThe user's current local date and time is {now}{tz}. "
-        "Use it to work out words like today, tomorrow, tonight or in 2 hours. "
-        "If the time of an alarm or event is unclear, ask."
-    )
 
 
 @app.get("/")
@@ -343,7 +314,9 @@ def chat(body: ChatIn, x_app_token: str = Header(default="")):
     if x_app_token != APP_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    messages = [{"role": "system", "content": build_system(body.now, body.timezone)}]
+    now = datetime.now(TZ)
+    system = SYSTEM_BASE + f"\n\nCurrent date and time in Lagos: {now:%A, %d %B %Y, %H:%M}."
+    messages = [{"role": "system", "content": system}]
     messages += [m.model_dump() for m in body.messages]
     actions = []
 
@@ -360,7 +333,10 @@ def chat(body: ChatIn, x_app_token: str = Header(default="")):
 
         msg = resp.choices[0].message
         if not msg.tool_calls:
-            return {"reply": (msg.content or "").replace("**", ""), "actions": actions}
+            return {
+                "reply": (msg.content or "").replace("**", ""),
+                "actions": actions,
+            }
 
         messages.append(
             {
@@ -384,20 +360,7 @@ def chat(body: ChatIn, x_app_token: str = Header(default="")):
                 args = json.loads(c.function.arguments or "{}")
             except json.JSONDecodeError:
                 args = {}
-            if c.function.name in DEVICE_TOOLS:
-                action, error = prepare_device_action(c.function.name, args)
-                if error:
-                    output = error
-                else:
-                    action["id"] = c.id
-                    actions.append(action)
-                    output = {
-                        "status": "prepared",
-                        "note": "The app will show the user a Confirm button. "
-                                "It is NOT done yet. Tell the user it is ready to confirm.",
-                    }
-            else:
-                output = run_tool(c.function.name, args)
+            output = run_tool(c.function.name, args, actions)
             messages.append(
                 {
                     "role": "tool",
@@ -407,7 +370,7 @@ def chat(body: ChatIn, x_app_token: str = Header(default="")):
                 }
             )
 
-    return {"reply": "Sorry, that took too many steps. Please try again.", "actions": actions}
+    return {"reply": "Sorry, that took too many steps. Please try again.", "actions": []}
 
 
 @app.get("/invoices")
@@ -419,4 +382,3 @@ def list_invoices(x_app_token: str = Header(default="")):
     except psycopg.Error as e:
         print("Database error:", e)
         raise HTTPException(status_code=503, detail="Database unavailable")
-    
