@@ -553,4 +553,21 @@ def chat(body: ChatIn, x_app_token: str = Header(default="")):
 
 @app.get("/memories")
 def list_memories(x_app_token: str = Header(default="")):
-   
+    if x_app_token != APP_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    try:
+        return load_memories()
+    except psycopg.Error as e:
+        print("Database error:", e)
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+
+@app.get("/invoices")
+def list_invoices(x_app_token: str = Header(default="")):
+    if x_app_token != APP_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    try:
+        return load_invoices()
+    except psycopg.Error as e:
+        print("Database error:", e)
+        raise HTTPException(status_code=503, detail="Database unavailable")
