@@ -553,7 +553,7 @@ def health():
 
 
 class AuthIn(BaseModel):
-     email: str
+    email: str
     password: str
     invite: str = ""
 
