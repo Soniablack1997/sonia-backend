@@ -536,7 +536,29 @@ def run_tool(name, args, actions, uid):
                 return {"error": "that time is in the past; check the date and year"}
             duration = int(args.get("duration_minutes") or 60)
             if not (5 <= duration <= 1440):
-                return {"error},
+                return {"error
+        "function": {
+            "name": "remember",
+            "description": "Save one short fact about the user for future chats.",
+            "parameters": {
+                "type": "object",
+                "properties": {"fact": {"type": "string"}},
+                "required": ["fact"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "forget",
+            "description": "Delete saved facts that contain a keyword.",
+            "parameters": {
+                "type": "object",
+                "properties": {"keyword": {"type": "string"}},
+                "required": ["keyword"],
+            },
+        },
+    },
 ]
 
 _table_ready = False
@@ -789,7 +811,7 @@ def run_tool(name, args, actions, uid):
                     "summary": summary,
                 }
             )
-            return {"status": "waiting for the user to tap Confirm on their phone"}
+            return {"status": "sent to the phone and running now"}
 
         if name == "set_timer":
             seconds = int(args["seconds"])
@@ -807,7 +829,7 @@ def run_tool(name, args, actions, uid):
                     "summary": summary,
                 }
             )
-            return {"status": "waiting for the user to tap Confirm on their phone"}
+            return {"status": "sent to the phone and running now"}
 
         if name == "add_calendar_event":
             title = clean_label(args["title"])
@@ -832,7 +854,7 @@ def run_tool(name, args, actions, uid):
                     "summary": f"Add to calendar: {title} on {start:%a %d %b, %H:%M}",
                 }
             )
-            return {"status": "waiting for the user to tap Confirm on their phone"}
+            return {"status": "sent to the phone and running now"}
 
         if name in ("draft_sms", "whatsapp_message", "call_number"):
             phone = normalize_phone(args.get("phone"))
@@ -855,7 +877,14 @@ def run_tool(name, args, actions, uid):
                         "summary": f"Draft {kind} to {phone}: {message[:80]}",
                     }
                 )
-            return {"status": "waiting for the user to tap Confirm and send it themselves"}
+            return {"status": "opened on the phone as a draft; the user still presses send themselves"}
+
+        if name == "open_app":
+            app_name = clean_label(args.get("app"))
+            if not app_name:
+                return {"error": "app name is required"}
+            actions.append({"type": "open_app", "app": app_name, "summary": "Open " + app_name})
+            return {"status": "sent to the phone and running now"}
 
         if name == "control_phone":
             goal = str(args.get("goal") or "").strip()[:300]
@@ -865,10 +894,11 @@ def run_tool(name, args, actions, uid):
                 {
                     "type": "control_phone",
                     "goal": goal,
+                    "app": clean_label(args.get("app")),
                     "summary": "Let Sonia control your phone: " + goal[:120],
                 }
             )
-            return {"status": "waiting for the user to tap Confirm on their phone"}
+            return {"status": "sent to the phone and running now"}
 
         if name == "remember":
             fact = str(args["fact"]).strip()[:300]
