@@ -1,5 +1,10 @@
+import hashlib
+import hmac
 import json
 import os
+import re
+import secrets
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -12,8 +17,9 @@ from pydantic import BaseModel
 app = FastAPI()
 client = Groq()  # reads GROQ_API_KEY from the environment
 MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
-APP_TOKEN = os.environ["APP_TOKEN"]
-DATABASE_URL = os.environ.get("DATABASE_URL")  # Neon connection string
+DATABASE_URL = os.environ["DATABASE_URL"]  # Neon connection string
+INVITE_CODE = os.environ.get("INVITE_CODE", "")  # if set, sign-up needs this code
+SESSION_DAYS = 90
 
 # Lagos is UTC+1 all year (no daylight saving).
 TZ = timezone(timedelta(hours=1))
@@ -203,9 +209,6 @@ TOOLS = [
     },
 ]
 
-# Used only if DATABASE_URL is not set (invoices then vanish on restart).
-INVOICES = {}
-MEMORIES = []
 _table_ready = False
 
 
@@ -216,9 +219,22 @@ def db():
 
 def ensure_table():
     global _table_ready
-    if _table_ready or not DATABASE_URL:
+    if _table_ready:
         return
     with db() as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS users ("
+            "id SERIAL PRIMARY KEY, "
+            "email TEXT NOT NULL UNIQUE, "
+            "pw_hash TEXT NOT NULL, "
+            "created_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS sessions ("
+            "token_hash TEXT PRIMARY KEY, "
+            "user_id INT NOT NULL, "
+            "created_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+        )
         conn.execute(
             "CREATE TABLE IF NOT EXISTS invoices ("
             "id TEXT PRIMARY KEY, "
@@ -231,63 +247,119 @@ def ensure_table():
             "fact TEXT NOT NULL, "
             "created_at TIMESTAMPTZ NOT NULL DEFAULT now())"
         )
+        conn.execute("ALTER TABLE invoices ADD COLUMN IF NOT EXISTS user_id INT")
+        conn.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS user_id INT")
     _table_ready = True
 
 
-def save_invoice(invoice):
-    if DATABASE_URL:
+# ---------- accounts ----------
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_failures = {}  # email -> list of failure timestamps (simple brute-force guard)
+
+
+def hash_password(password):
+    salt = secrets.token_bytes(16)
+    digest = hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1)
+    return salt.hex() + "$" + digest.hex()
+
+
+def check_password(password, stored):
+    try:
+        salt_hex, digest_hex = stored.split("$")
+        digest = hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt_hex), n=2**14, r=8, p=1)
+        return hmac.compare_digest(digest.hex(), digest_hex)
+    except ValueError:
+        return False
+
+
+def token_hash(token):
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def new_session(conn, user_id):
+    token = secrets.token_urlsafe(32)
+    conn.execute(
+        "INSERT INTO sessions (token_hash, user_id) VALUES (%s, %s)",
+        (token_hash(token), user_id),
+    )
+    return token
+
+
+def too_many_failures(email):
+    recent = [t for t in _failures.get(email, []) if time.time() - t < 900]
+    _failures[email] = recent
+    return len(recent) >= 5
+
+
+def current_user(authorization):
+    """Return the user id for 'Bearer <token>' or raise 401."""
+    token = ""
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization[7:].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Please log in")
+    try:
         ensure_table()
         with db() as conn:
-            conn.execute(
-                "INSERT INTO invoices (id, data) VALUES (%s, %s)",
-                (invoice["id"], Jsonb(invoice)),
-            )
-    else:
-        INVOICES[invoice["id"]] = invoice
+            row = conn.execute(
+                "SELECT user_id FROM sessions WHERE token_hash = %s "
+                "AND created_at > now() - make_interval(days => %s)",
+                (token_hash(token), SESSION_DAYS),
+            ).fetchone()
+    except psycopg.Error as e:
+        print("Database error:", e)
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    if not row:
+        raise HTTPException(status_code=401, detail="Please log in again")
+    return row[0]
 
 
-def load_invoices():
-    if DATABASE_URL:
-        ensure_table()
-        with db() as conn:
-            rows = conn.execute(
-                "SELECT data FROM invoices ORDER BY created_at DESC LIMIT 100"
-            ).fetchall()
-        return [r[0] for r in rows]
-    return list(INVOICES.values())
+# ---------- data (always scoped to one user) ----------
+
+def save_invoice(uid, invoice):
+    ensure_table()
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO invoices (id, data, user_id) VALUES (%s, %s, %s)",
+            (invoice["id"], Jsonb(invoice), uid),
+        )
 
 
-def save_memory(fact):
-    if DATABASE_URL:
-        ensure_table()
-        with db() as conn:
-            conn.execute("INSERT INTO memories (fact) VALUES (%s)", (fact,))
-    else:
-        MEMORIES.append(fact)
+def load_invoices(uid):
+    ensure_table()
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT data FROM invoices WHERE user_id = %s ORDER BY created_at DESC LIMIT 100",
+            (uid,),
+        ).fetchall()
+    return [r[0] for r in rows]
 
 
-def load_memories():
-    if DATABASE_URL:
-        ensure_table()
-        with db() as conn:
-            rows = conn.execute(
-                "SELECT fact FROM memories ORDER BY created_at DESC LIMIT 50"
-            ).fetchall()
-        return [r[0] for r in rows]
-    return list(reversed(MEMORIES))
+def save_memory(uid, fact):
+    ensure_table()
+    with db() as conn:
+        conn.execute("INSERT INTO memories (fact, user_id) VALUES (%s, %s)", (fact, uid))
 
 
-def delete_memories(keyword):
-    if DATABASE_URL:
-        ensure_table()
-        with db() as conn:
-            cur = conn.execute(
-                "DELETE FROM memories WHERE fact ILIKE %s", (f"%{keyword}%",)
-            )
-            return cur.rowcount
-    before = len(MEMORIES)
-    MEMORIES[:] = [m for m in MEMORIES if keyword.lower() not in m.lower()]
-    return before - len(MEMORIES)
+def load_memories(uid):
+    ensure_table()
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT fact FROM memories WHERE user_id = %s ORDER BY created_at DESC LIMIT 50",
+            (uid,),
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+def delete_memories(uid, keyword):
+    ensure_table()
+    with db() as conn:
+        cur = conn.execute(
+            "DELETE FROM memories WHERE user_id = %s AND fact ILIKE %s",
+            (uid, f"%{keyword}%"),
+        )
+        return cur.rowcount
 
 
 def normalize_phone(raw):
@@ -324,7 +396,7 @@ def fmt_duration(total):
     return " ".join(parts)
 
 
-def run_tool(name, args, actions):
+def run_tool(name, args, actions, uid):
     try:
         if name == "create_invoice":
             currency = args.get("currency", "NGN")
@@ -356,7 +428,7 @@ def run_tool(name, args, actions):
                 "workings": workings,
                 "total_text": f"Total: {currency} {total:,.2f}",
             }
-            save_invoice(invoice)
+            save_invoice(uid, invoice)
             return invoice
 
         if name == "set_alarm":
@@ -449,14 +521,14 @@ def run_tool(name, args, actions):
             fact = str(args["fact"]).strip()[:300]
             if not fact:
                 return {"error": "fact is required"}
-            save_memory(fact)
+            save_memory(uid, fact)
             return {"status": "saved", "fact": fact}
 
         if name == "forget":
             keyword = str(args["keyword"]).strip()
             if len(keyword) < 2:
                 return {"error": "keyword is too short"}
-            return {"status": "deleted", "count": delete_memories(keyword)}
+            return {"status": "deleted", "count": delete_memories(uid, keyword)}
 
         return {"error": "unknown tool"}
     except (KeyError, TypeError, ValueError) as e:
@@ -480,94 +552,6 @@ def health():
     return {"status": "ok"}
 
 
-@app.post("/chat")
-def chat(body: ChatIn, x_app_token: str = Header(default="")):
-    if x_app_token != APP_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    now = datetime.now(TZ)
-    system = SYSTEM_BASE + f"\n\nCurrent date and time in Lagos: {now:%A, %d %B %Y, %H:%M}."
-    try:
-        facts = load_memories()
-    except psycopg.Error as e:
-        print("Database error:", e)
-        facts = []
-    if facts:
-        system += "\n\nWhat you remember about the user:\n" + "\n".join("- " + f for f in facts)
-    messages = [{"role": "system", "content": system}]
-    messages += [m.model_dump() for m in body.messages]
-    actions = []
-
-    for _ in range(5):
-        try:
-            resp = client.chat.completions.create(
-                model=MODEL,
-                messages=messages,
-                tools=TOOLS,
-                max_tokens=1024,
-            )
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Model error: {e}")
-
-        msg = resp.choices[0].message
-        if not msg.tool_calls:
-            return {
-                "reply": (msg.content or "").replace("**", ""),
-                "actions": actions,
-            }
-
-        messages.append(
-            {
-                "role": "assistant",
-                "content": msg.content or "",
-                "tool_calls": [
-                    {
-                        "id": c.id,
-                        "type": "function",
-                        "function": {
-                            "name": c.function.name,
-                            "arguments": c.function.arguments,
-                        },
-                    }
-                    for c in msg.tool_calls
-                ],
-            }
-        )
-        for c in msg.tool_calls:
-            try:
-                args = json.loads(c.function.arguments or "{}")
-            except json.JSONDecodeError:
-                args = {}
-            output = run_tool(c.function.name, args, actions)
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": c.id,
-                    "name": c.function.name,
-                    "content": json.dumps(output),
-                }
-            )
-
-    return {"reply": "Sorry, that took too many steps. Please try again.", "actions": []}
-
-
-@app.get("/memories")
-def list_memories(x_app_token: str = Header(default="")):
-    if x_app_token != APP_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    try:
-        return load_memories()
-    except psycopg.Error as e:
-        print("Database error:", e)
-        raise HTTPException(status_code=503, detail="Database unavailable")
-
-
-@app.get("/invoices")
-def list_invoices(x_app_token: str = Header(default="")):
-    if x_app_token != APP_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    try:
-        return load_invoices()
-    except psycopg.Error as e:
-        print("Database error:", e)
-        raise HTTPException(status_code=503, detail="Database unavailable")
+class AuthIn(BaseModel):
+    email: str
+    
