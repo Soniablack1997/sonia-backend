@@ -553,5 +553,156 @@ def health():
 
 
 class AuthIn(BaseModel):
-    email: str
-    
+     email: str
+    password: str
+    invite: str = ""
+
+
+@app.post("/register")
+def register(body: AuthIn):
+    email = body.email.strip().lower()
+    if not EMAIL_RE.match(email) or len(email) > 200:
+        raise HTTPException(status_code=400, detail="Enter a valid email address")
+    if len(body.password) < 8 or len(body.password) > 200:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    if INVITE_CODE and not hmac.compare_digest(body.invite.strip(), INVITE_CODE):
+        raise HTTPException(status_code=403, detail="Wrong invite code")
+    try:
+        ensure_table()
+        pw = hash_password(body.password)
+        with db() as conn:
+            exists = conn.execute("SELECT 1 FROM users WHERE email = %s", (email,)).fetchone()
+            if exists:
+                raise HTTPException(status_code=409, detail="That email already has an account. Log in instead.")
+            first = conn.execute("SELECT count(*) FROM users").fetchone()[0] == 0
+            uid = conn.execute(
+                "INSERT INTO users (email, pw_hash) VALUES (%s, %s) RETURNING id", (email, pw)
+            ).fetchone()[0]
+            if first:
+                # The very first account adopts data saved before accounts existed.
+                conn.execute("UPDATE invoices SET user_id = %s WHERE user_id IS NULL", (uid,))
+                conn.execute("UPDATE memories SET user_id = %s WHERE user_id IS NULL", (uid,))
+            token = new_session(conn, uid)
+    except psycopg.Error as e:
+        print("Database error:", e)
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    return {"token": token}
+
+
+@app.post("/login")
+def login(body: AuthIn):
+    email = body.email.strip().lower()
+    if too_many_failures(email):
+        raise HTTPException(status_code=429, detail="Too many tries. Wait 15 minutes and try again.")
+    try:
+        ensure_table()
+        with db() as conn:
+            row = conn.execute("SELECT id, pw_hash FROM users WHERE email = %s", (email,)).fetchone()
+            ok = bool(row) and check_password(body.password, row[1])
+            if not ok:
+                _failures.setdefault(email, []).append(time.time())
+                raise HTTPException(status_code=401, detail="Wrong email or password")
+            token = new_session(conn, row[0])
+    except psycopg.Error as e:
+        print("Database error:", e)
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    return {"token": token}
+
+
+@app.post("/logout")
+def logout(authorization: str = Header(default="")):
+    current_user(authorization)
+    token = authorization[7:].strip()
+    with db() as conn:
+        conn.execute("DELETE FROM sessions WHERE token_hash = %s", (token_hash(token),))
+    return {"status": "ok"}
+
+
+@app.post("/chat")
+def chat(body: ChatIn, authorization: str = Header(default="")):
+    uid = current_user(authorization)
+
+    now = datetime.now(TZ)
+    system = SYSTEM_BASE + f"\n\nCurrent date and time in Lagos: {now:%A, %d %B %Y, %H:%M}."
+    try:
+        facts = load_memories(uid)
+    except psycopg.Error as e:
+        print("Database error:", e)
+        facts = []
+    if facts:
+        system += "\n\nWhat you remember about the user:\n" + "\n".join("- " + f for f in facts)
+    messages = [{"role": "system", "content": system}]
+    messages += [m.model_dump() for m in body.messages]
+    actions = []
+
+    for _ in range(5):
+        try:
+            resp = client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                tools=TOOLS,
+                max_tokens=1024,
+            )
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Model error: {e}")
+
+        msg = resp.choices[0].message
+        if not msg.tool_calls:
+            return {
+                "reply": (msg.content or "").replace("**", ""),
+                "actions": actions,
+            }
+
+        messages.append(
+            {
+                "role": "assistant",
+                "content": msg.content or "",
+                "tool_calls": [
+                    {
+                        "id": c.id,
+                        "type": "function",
+                        "function": {
+                            "name": c.function.name,
+                            "arguments": c.function.arguments,
+                        },
+                    }
+                    for c in msg.tool_calls
+                ],
+            }
+        )
+        for c in msg.tool_calls:
+            try:
+                args = json.loads(c.function.arguments or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            output = run_tool(c.function.name, args, actions, uid)
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": c.id,
+                    "name": c.function.name,
+                    "content": json.dumps(output),
+                }
+            )
+
+    return {"reply": "Sorry, that took too many steps. Please try again.", "actions": []}
+
+
+@app.get("/memories")
+def list_memories(authorization: str = Header(default="")):
+    uid = current_user(authorization)
+    try:
+        return load_memories(uid)
+    except psycopg.Error as e:
+        print("Database error:", e)
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+
+@app.get("/invoices")
+def list_invoices(authorization: str = Header(default="")):
+    uid = current_user(authorization)
+    try:
+        return load_invoices(uid)
+    except psycopg.Error as e:
+        print("Database error:", e)
+        raise HTTPException(status_code=503, detail="Database unavailable")
