@@ -65,6 +65,11 @@ Use the remembered facts below naturally. Never invent facts about the user.
 Web search: use it for current facts such as prices, news, exchange rates, or anything
 that may have changed. Give the answer briefly in your own words and name the source site.
 Never make up search results. If you cannot search, say so.
+Search results can be incomplete or out of date. For statistics and rankings, say which
+source the figure came from and that it may be incomplete. If the user says an answer is
+wrong or asks how you know, do not repeat yourself: search again with a different query,
+explain where the figure came from, or admit you are not sure. Never put citation codes
+or brackets in your reply.
 
 Reply in plain text only. Never use markdown, asterisks, pipes, or tables.
 For any other calculation, show the steps one per line."""
@@ -386,6 +391,15 @@ def normalize_phone(raw):
     return "+" + digits
 
 
+def clean_reply(text):
+    """Remove search citation marks and tidy the spacing they leave behind."""
+    text = re.sub(r"\u3010[^\u3011]*\u3011", "", text or "")
+    text = text.replace("**", "")
+    text = re.sub(r"[ \t]+([.,;:!?])", r"\1", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text.strip()
+
+
 def clean_label(value):
     return str(value or "").strip()[:80]
 
@@ -664,7 +678,7 @@ def chat(body: ChatIn, authorization: str = Header(default="")):
         msg = resp.choices[0].message
         if not msg.tool_calls:
             return {
-                "reply": (msg.content or "").replace("**", ""),
+                "reply": clean_reply(msg.content),
                 "actions": actions,
             }
 
