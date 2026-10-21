@@ -17,6 +17,8 @@ from pydantic import BaseModel
 app = FastAPI()
 client = Groq()  # reads GROQ_API_KEY from the environment
 MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+# Groq's built-in web search only works on the gpt-oss models.
+SEARCH_ON = MODEL.startswith("openai/gpt-oss")
 DATABASE_URL = os.environ["DATABASE_URL"]  # Neon connection string
 INVITE_CODE = os.environ.get("INVITE_CODE", "")  # if set, sign-up needs this code
 SESSION_DAYS = 90
@@ -30,6 +32,7 @@ Keep replies short and practical. Reply in the language the user writes in
 If the user writes in Nigerian Pidgin, reply in Nigerian Pidgin, not English.
 
 What you can do: create invoices, do calculations, remember facts about the user,
+search the web for current information when you have the search tool,
 and prepare phone actions (set an alarm, start a timer, add a calendar event,
 draft an SMS, open the phone dialer, draft a WhatsApp message).
 You cannot do anything else
@@ -58,6 +61,10 @@ Memory: when the user tells you something worth keeping (their name, business, u
 currency, customers, prices, preferences) or says "remember", call remember with one
 short fact. When they ask you to forget something, call forget with a keyword.
 Use the remembered facts below naturally. Never invent facts about the user.
+
+Web search: use it for current facts such as prices, news, exchange rates, or anything
+that may have changed. Give the answer briefly in your own words and name the source site.
+Never make up search results. If you cannot search, say so.
 
 Reply in plain text only. Never use markdown, asterisks, pipes, or tables.
 For any other calculation, show the steps one per line."""
@@ -637,13 +644,20 @@ def chat(body: ChatIn, authorization: str = Header(default="")):
     actions = []
 
     for _ in range(5):
+        kwargs = {"model": MODEL, "messages": messages, "max_tokens": 2048}
+        if SEARCH_ON:
+            kwargs["extra_body"] = {"reasoning_effort": "low"}
         try:
-            resp = client.chat.completions.create(
-                model=MODEL,
-                messages=messages,
-                tools=TOOLS,
-                max_tokens=1024,
-            )
+            if SEARCH_ON:
+                try:
+                    resp = client.chat.completions.create(
+                        tools=TOOLS + [{"type": "browser_search"}], **kwargs
+                    )
+                except Exception as e:
+                    print("Search tool failed, retrying without it:", e)
+                    resp = client.chat.completions.create(tools=TOOLS, **kwargs)
+            else:
+                resp = client.chat.completions.create(tools=TOOLS, **kwargs)
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Model error: {e}")
 
