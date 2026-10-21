@@ -421,6 +421,7 @@ def run_tool(name, args, actions, uid):
                 )
             invoice = {
                 "id": "INV-" + uuid.uuid4().hex[:8].upper(),
+                "date": f"{datetime.now(TZ):%d %b %Y}",
                 "customer": args["customer"],
                 "currency": currency,
                 "items": lines,
