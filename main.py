@@ -47,16 +47,16 @@ quantity x unit price = line total, then the total. Never do invoice arithmetic
 yourself; copy the numbers from the tool result.
 If the tool returns an error, tell the user the invoice was NOT saved.
 
-Phone actions: they are NOT done until the user taps Confirm on their phone. After
-calling one, say something short like "Tap Confirm to set it". Never say it is
-already done. Use these tools only when the user asks. For a time of day use set_alarm,
-for a countdown use set_timer, for a specific date and time use add_calendar_event.
-Work out dates from the current date and time given below.
+Phone actions: they run on the user's phone straight away when you call the tool, with
+no Confirm step. Say briefly what you are doing, for example "Setting your alarm for
+7:00." Use these tools only when the user asks. To open an app use open_app. For a time of
+day use set_alarm, for a countdown use set_timer, for a specific date and time use
+add_calendar_event. Work out dates from the current date and time given below.
 Messages and calls: you cannot read the user's contacts, so you need the phone number
-from the user (or from remembered facts). Never guess a number. Nothing is sent or
-called until the user taps Confirm and then sends or dials it themselves. Write the
-message text yourself in the user's wording, then use draft_sms or whatsapp_message.
-Use call_number to open the dialer.
+from the user (or from remembered facts). Never guess a number. A message opens as a draft
+and the user presses send themselves; a call opens the dialer and the user presses call.
+Write the message text yourself in the user's wording, then use draft_sms or
+whatsapp_message. Use call_number to open the dialer.
 
 Memory: when the user tells you something worth keeping (their name, business, usual
 currency, customers, prices, preferences) or says "remember", call remember with one
@@ -65,8 +65,9 @@ Use the remembered facts below naturally. Never invent facts about the user.
 
 Phone control: use control_phone only when the user asks you to do something inside
 another app that no other tool can do (for example read or reply in an app, or change a
-setting). Pass a clear goal in one sentence. The user must tap Confirm first, and the
-phone-control service must be switched on. Never use it for money, banking or passwords.
+setting). Pass a clear goal in one sentence, and pass app with the name of the app to
+open first (for example WhatsApp). It starts straight away; risky steps such as sending
+or deleting ask the user on screen. Never use it for money, banking or passwords.
 
 Web search: use it for current facts such as prices, news, exchange rates, or anything
 that may have changed. Give the answer briefly in your own words and name the source site.
@@ -112,7 +113,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "set_alarm",
-            "description": "Prepare an alarm at a time of day on the user's phone. The user must tap Confirm.",
+            "description": "Prepare an alarm at a time of day on the user's phone. It runs on the phone right away.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -128,7 +129,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "set_timer",
-            "description": "Prepare a countdown timer on the user's phone. The user must tap Confirm.",
+            "description": "Prepare a countdown timer on the user's phone. It runs on the phone right away.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -143,7 +144,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "add_calendar_event",
-            "description": "Prepare a calendar event or reminder for a specific date and time. The user must tap Confirm.",
+            "description": "Prepare a calendar event or reminder for a specific date and time. It runs on the phone right away.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -163,7 +164,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "draft_sms",
-            "description": "Prepare an SMS draft. The user must tap Confirm and then send it themselves.",
+            "description": "Prepare an SMS draft. It opens as a draft and the user presses send.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -178,7 +179,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "whatsapp_message",
-            "description": "Prepare a WhatsApp message draft. The user must tap Confirm and then send it themselves.",
+            "description": "Prepare a WhatsApp message draft. It opens as a draft and the user presses send.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -193,7 +194,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "call_number",
-            "description": "Open the phone dialer with a number filled in. The user must tap Confirm and then dial.",
+            "description": "Open the phone dialer with a number filled in. The user presses call.",
             "parameters": {
                 "type": "object",
                 "properties": {"phone": {"type": "string"}},
@@ -204,11 +205,26 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "control_phone",
-            "description": "Carry out a task by operating apps on the user's phone screen (tap, type, scroll). The user must tap Confirm.",
+            "name": "open_app",
+            "description": "Open an installed app on the user's phone right away, e.g. WhatsApp, Camera, Settings.",
             "parameters": {
                 "type": "object",
-                "properties": {"goal": {"type": "string", "description": "The task in one clear sentence"}},
+                "properties": {"app": {"type": "string", "description": "App name"}},
+                "required": ["app"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "control_phone",
+            "description": "Carry out a task by operating apps on the user's phone screen (tap, type, scroll). It runs on the phone right away.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal": {"type": "string", "description": "The task in one clear sentence"},
+                    "app": {"type": "string", "description": "App to open first, e.g. WhatsApp"},
+                },
                 "required": ["goal"],
             },
         },
@@ -237,6 +253,290 @@ TOOLS = [
             },
         },
     },
+]
+
+_table_ready = False
+
+
+def db():
+    # prepare_threshold=None keeps this safe with Neon's connection pooler.
+    return psycopg.connect(DATABASE_URL, prepare_threshold=None, connect_timeout=10)
+
+
+def ensure_table():
+    global _table_ready
+    if _table_ready:
+        return
+    with db() as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS users ("
+            "id SERIAL PRIMARY KEY, "
+            "email TEXT NOT NULL UNIQUE, "
+            "pw_hash TEXT NOT NULL, "
+            "created_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS sessions ("
+            "token_hash TEXT PRIMARY KEY, "
+            "user_id INT NOT NULL, "
+            "created_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS invoices ("
+            "id TEXT PRIMARY KEY, "
+            "data JSONB NOT NULL, "
+            "created_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS memories ("
+            "id SERIAL PRIMARY KEY, "
+            "fact TEXT NOT NULL, "
+            "created_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+        )
+        conn.execute("ALTER TABLE invoices ADD COLUMN IF NOT EXISTS user_id INT")
+        conn.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS user_id INT")
+    _table_ready = True
+
+
+# ---------- accounts ----------
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_failures = {}  # email -> list of failure timestamps (simple brute-force guard)
+
+
+def hash_password(password):
+    salt = secrets.token_bytes(16)
+    digest = hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1)
+    return salt.hex() + "$" + digest.hex()
+
+
+def check_password(password, stored):
+    try:
+        salt_hex, digest_hex = stored.split("$")
+        digest = hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt_hex), n=2**14, r=8, p=1)
+        return hmac.compare_digest(digest.hex(), digest_hex)
+    except ValueError:
+        return False
+
+
+def token_hash(token):
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def new_session(conn, user_id):
+    token = secrets.token_urlsafe(32)
+    conn.execute(
+        "INSERT INTO sessions (token_hash, user_id) VALUES (%s, %s)",
+        (token_hash(token), user_id),
+    )
+    return token
+
+
+def too_many_failures(email):
+    recent = [t for t in _failures.get(email, []) if time.time() - t < 900]
+    _failures[email] = recent
+    return len(recent) >= 5
+
+
+def current_user(authorization):
+    """Return the user id for 'Bearer <token>' or raise 401."""
+    token = ""
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization[7:].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Please log in")
+    try:
+        ensure_table()
+        with db() as conn:
+            row = conn.execute(
+                "SELECT user_id FROM sessions WHERE token_hash = %s "
+                "AND created_at > now() - make_interval(days => %s)",
+                (token_hash(token), SESSION_DAYS),
+            ).fetchone()
+    except psycopg.Error as e:
+        print("Database error:", e)
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    if not row:
+        raise HTTPException(status_code=401, detail="Please log in again")
+    return row[0]
+
+
+# ---------- data (always scoped to one user) ----------
+
+def save_invoice(uid, invoice):
+    ensure_table()
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO invoices (id, data, user_id) VALUES (%s, %s, %s)",
+            (invoice["id"], Jsonb(invoice), uid),
+        )
+
+
+def load_invoices(uid):
+    ensure_table()
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT data FROM invoices WHERE user_id = %s ORDER BY created_at DESC LIMIT 100",
+            (uid,),
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+def save_memory(uid, fact):
+    ensure_table()
+    with db() as conn:
+        conn.execute("INSERT INTO memories (fact, user_id) VALUES (%s, %s)", (fact, uid))
+
+
+def load_memories(uid):
+    ensure_table()
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT fact FROM memories WHERE user_id = %s ORDER BY created_at DESC LIMIT 50",
+            (uid,),
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+def delete_memories(uid, keyword):
+    ensure_table()
+    with db() as conn:
+        cur = conn.execute(
+            "DELETE FROM memories WHERE user_id = %s AND fact ILIKE %s",
+            (uid, f"%{keyword}%"),
+        )
+        return cur.rowcount
+
+
+def normalize_phone(raw):
+    """Return digits with a leading + , or None if it doesn't look like a number."""
+    text = str(raw or "").strip()
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if text.startswith("00"):
+        digits = digits[2:]
+        text = "+" + digits
+    if not text.startswith("+"):
+        if digits.startswith("0") and len(digits) == 11:
+            digits = "234" + digits[1:]  # Nigerian local format
+        elif len(digits) == 10 and digits[0] in "789":
+            digits = "234" + digits
+    if not (8 <= len(digits) <= 15):
+        return None
+    return "+" + digits
+
+
+def clean_reply(text):
+    """Remove search citation marks and tidy the spacing they leave behind."""
+    text = re.sub(r"\u3010[^\u3011]*\u3011", "", text or "")
+    text = text.replace("**", "")
+    text = re.sub(r"[ \t]+([.,;:!?])", r"\1", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text.strip()
+
+
+def clean_label(value):
+    return str(value or "").strip()[:80]
+
+
+def fmt_duration(total):
+    hours, rest = divmod(total, 3600)
+    minutes, seconds = divmod(rest, 60)
+    parts = []
+    if hours:
+        parts.append(f"{hours} h")
+    if minutes:
+        parts.append(f"{minutes} min")
+    if seconds:
+        parts.append(f"{seconds} s")
+    return " ".join(parts)
+
+
+def run_tool(name, args, actions, uid):
+    try:
+        if name == "create_invoice":
+            currency = args.get("currency", "NGN")
+            lines = []
+            workings = []
+            total = 0.0
+            for item in args["items"]:
+                qty = float(item["quantity"])
+                price = float(item["unit_price"])
+                line_total = qty * price
+                total += line_total
+                lines.append(
+                    {
+                        "description": item["description"],
+                        "quantity": qty,
+                        "unit_price": price,
+                        "line_total": line_total,
+                    }
+                )
+                workings.append(
+                    f'{item["description"]}: {qty:g} x {price:,.2f} = {line_total:,.2f}'
+                )
+            invoice = {
+                "id": "INV-" + uuid.uuid4().hex[:8].upper(),
+                "date": f"{datetime.now(TZ):%d %b %Y}",
+                "customer": args["customer"],
+                "currency": currency,
+                "items": lines,
+                "total": total,
+                "workings": workings,
+                "total_text": f"Total: {currency} {total:,.2f}",
+            }
+            save_invoice(uid, invoice)
+            return invoice
+
+        if name == "set_alarm":
+            hour = int(args["hour"])
+            minute = int(args.get("minute", 0))
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                return {"error": "hour must be 0-23 and minute 0-59"}
+            label = clean_label(args.get("label"))
+            summary = f"Set alarm for {hour:02d}:{minute:02d}"
+            if label:
+                summary += f" - {label}"
+            actions.append(
+                {
+                    "type": "set_alarm",
+                    "hour": hour,
+                    "minute": minute,
+                    "label": label,
+                    "summary": summary,
+                }
+            )
+            return {"status": "sent to the phone and running now"}
+
+        if name == "set_timer":
+            seconds = int(args["seconds"])
+            if not (1 <= seconds <= 86400):
+                return {"error": "seconds must be between 1 and 86400"}
+            label = clean_label(args.get("label"))
+            summary = f"Start timer for {fmt_duration(seconds)}"
+            if label:
+                summary += f" - {label}"
+            actions.append(
+                {
+                    "type": "set_timer",
+                    "seconds": seconds,
+                    "label": label,
+                    "summary": summary,
+                }
+            )
+            return {"status": "sent to the phone and running now"}
+
+        if name == "add_calendar_event":
+            title = clean_label(args["title"])
+            if not title:
+                return {"error": "title is required"}
+            start = datetime.fromisoformat(str(args["start"]))
+            if start.tzinfo is None:
+                start = start.replace(tzinfo=TZ)
+            if start < datetime.now(TZ) - timedelta(minutes=1):
+                return {"error": "that time is in the past; check the date and year"}
+            duration = int(args.get("duration_minutes") or 60)
+            if not (5 <= duration <= 1440):
+                return {"error},
 ]
 
 _table_ready = False
