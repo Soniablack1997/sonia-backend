@@ -1,5 +1,7 @@
 fastapi
-uvicorn
-groq
-pydantic
+uvicorn[standard]
 psycopg[binary]
+groq
+google-genai
+pydantic[email]
+email-validator
