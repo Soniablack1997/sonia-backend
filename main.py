@@ -303,7 +303,10 @@ def health():
         "groq_configured": bool(GROQ_API_KEY),
         "gemini_configured": gemini_enabled(),
         "gemini_key_set": bool(GEMINI_API_KEY),
-        "gemini_library_installed": genai is not None,
+        "gemini_env_names": sorted(
+            k for k in os.environ if k.upper().startswith(("GEMINI", "GOOGLE"))
+        ),
+        "gemini_last_error": LAST_GEMINI_ERROR[:200],
         "email_configured": bool(RESEND_API_KEY)
     }
 
@@ -685,15 +688,17 @@ def run_tool(email: str, name: str, args: dict, actions: list) -> str:
 
 # ------------------------------------------------------------------- Gemini
 # Gemini is tried first. If it is missing, rate-limited or errors, Sonia falls back to Groq.
-try:
-    from google import genai
-    from google.genai import types as genai_types
-except Exception:  # package not installed: Groq is used instead
-    genai = None
-    genai_types = None
+# It talks to Google's web API directly, so no extra library is needed: only the key.
+def _env_first(*names):
+    for name in names:
+        value = os.getenv(name, "").strip().strip('"').strip("'").strip()
+        if value:
+            return value
+    return ""
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+
+GEMINI_API_KEY = _env_first("GEMINI_API_KEY", "GOOGLE_API_KEY", "GEMINI_KEY", "GEMINI_APIKEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip() or "gemini-3.8-flash"
 GEMINI_FALLBACK_MODELS = [
     m.strip()
     for m in os.getenv("GEMINI_FALLBACK_MODELS",
@@ -702,18 +707,46 @@ GEMINI_FALLBACK_MODELS = [
 ]
 GEMINI_UNAVAILABLE = set()   # models Google says do not exist for this key
 GEMINI_COOLDOWN = {}         # model -> time until which it is skipped
-_gemini_client = None
+LAST_GEMINI_ERROR = ""       # shown on /health so problems are visible without logs
+
+
+class GeminiError(Exception):
+    def __init__(self, code: int, detail: str):
+        super().__init__("%s %s" % (code, detail))
+        self.code = code
+        self.detail = detail
 
 
 def gemini_enabled() -> bool:
-    return bool(GEMINI_API_KEY and genai is not None)
+    return bool(GEMINI_API_KEY)
 
 
-def gemini_client():
-    global _gemini_client
-    if _gemini_client is None:
-        _gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-    return _gemini_client
+def gemini_request(model: str, payload: dict, timeout: int = 40) -> dict:
+    global LAST_GEMINI_ERROR
+    request = urllib.request.Request(
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        + model + ":generateContent",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": GEMINI_API_KEY,
+        },
+        method="POST"
+    )
+    for attempt in (0, 1):
+      try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+      except urllib.error.HTTPError as exc:
+        if exc.code in (500, 503) and attempt == 0:
+            time.sleep(1.5)
+            continue
+        detail = exc.read().decode("utf-8", errors="replace")
+        LAST_GEMINI_ERROR = "%s: HTTP %s %s" % (model, exc.code, detail[:200])
+        raise GeminiError(exc.code, detail[:500])
+      except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+        LAST_GEMINI_ERROR = "%s: %s" % (model, str(exc)[:200])
+        raise GeminiError(0, str(exc)[:300])
 
 
 def gemini_model_order():
@@ -724,69 +757,89 @@ def gemini_model_order():
     ]
 
 
+def gemini_schema(node):
+    # Gemini wants upper-case JSON-schema types (STRING, OBJECT, ARRAY).
+    if isinstance(node, dict):
+        out = {}
+        for key, value in node.items():
+            if key == "type" and isinstance(value, str):
+                out[key] = value.upper()
+            elif key == "properties" and isinstance(value, dict):
+                out[key] = {name: gemini_schema(sub) for name, sub in value.items()}
+            elif key == "items":
+                out[key] = gemini_schema(value)
+            else:
+                out[key] = value
+        return out
+    return node
+
+
 def gemini_tools():
-    decls = [
-        genai_types.FunctionDeclaration(
-            name=tool["function"]["name"],
-            description=tool["function"]["description"],
-            parameters_json_schema=tool["function"]["parameters"],
-        )
-        for tool in TOOLS
-    ]
-    return [genai_types.Tool(function_declarations=decls)]
+    return [{
+        "functionDeclarations": [
+            {
+                "name": tool["function"]["name"],
+                "description": tool["function"]["description"],
+                "parameters": gemini_schema(tool["function"]["parameters"]),
+            }
+            for tool in TOOLS
+        ]
+    }]
 
 
 def gemini_contents(turns):
-    """turns: list of (role, text). Merges same-role neighbours and starts with a user turn."""
+    # turns: list of (role, text). Merges same-role neighbours and starts with a user turn.
     merged = []
     for role, text in turns:
         role = "model" if role == "assistant" else "user"
-        if merged and merged[-1][0] == role:
-            merged[-1][1] += "\n" + text
+        if merged and merged[-1]["role"] == role:
+            merged[-1]["parts"][0]["text"] += "\n" + text
         else:
-            merged.append([role, text])
-    while merged and merged[0][0] != "user":
+            merged.append({"role": role, "parts": [{"text": text}]})
+    while merged and merged[0]["role"] != "user":
         merged.pop(0)
-    return [
-        genai_types.Content(role=role, parts=[genai_types.Part.from_text(text=text)])
-        for role, text in merged
-    ]
+    return merged
 
 
 def run_gemini(model, system_prompt, turns, email, actions):
-    config = genai_types.GenerateContentConfig(
-        system_instruction=system_prompt,
-        tools=gemini_tools(),
-        temperature=0.6,
-        max_output_tokens=1200,
-        automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(
-            disable=True
-        ),
-    )
     contents = gemini_contents(turns)
-    client = gemini_client()
 
     for _ in range(6):
-        resp = client.models.generate_content(
-            model=model, contents=contents, config=config
-        )
-        if not resp.candidates or resp.candidates[0].content is None:
+        data = gemini_request(model, {
+            "systemInstruction": {"parts": [{"text": system_prompt}]},
+            "contents": contents,
+            "tools": gemini_tools(),
+            "generationConfig": {"temperature": 0.6, "maxOutputTokens": 2000},
+        })
+
+        candidates = data.get("candidates") or []
+        parts = ((candidates[0].get("content") or {}).get("parts") or []) if candidates else []
+        if not candidates:
             raise RuntimeError("Gemini returned no content")
 
-        calls = resp.function_calls or []
+        calls = [p["functionCall"] for p in parts if "functionCall" in p]
         if not calls:
-            return (resp.text or "").strip()
+            return "".join(
+                p.get("text", "") for p in parts if not p.get("thought")
+            ).strip()
 
-        # Keep the model's own turn (it carries any thought signatures), then answer it.
-        contents.append(resp.candidates[0].content)
-        parts = []
+        # Send the model's own parts back unchanged (keeps Gemini 3 thought signatures).
+        contents.append({"role": "model", "parts": parts})
+        answers = []
         for call in calls:
-            args = dict(call.args or {})
-            result = run_tool(email, call.name, args, actions)
-            parts.append(genai_types.Part.from_function_response(
-                name=call.name, response={"result": result}
-            ))
-        contents.append(genai_types.Content(role="user", parts=parts))
+            args = call.get("args")
+            answers.append({
+                "functionResponse": {
+                    "name": call.get("name", ""),
+                    "response": {
+                        "result": run_tool(
+                            email, call.get("name", ""),
+                            args if isinstance(args, dict) else {}, actions
+                        )
+                    },
+                }
+            })
+        contents.append({"role": "user", "parts": answers})
 
     return ""
 
@@ -847,32 +900,34 @@ def run_web_search(query: str) -> str:
         return "Web search is unavailable right now. Tell the user you could not check live information."
 
     today = datetime.now(timezone.utc).strftime("%A %d %B %Y")
-    config = genai_types.GenerateContentConfig(
-        system_instruction=(
+    payload = {
+        "systemInstruction": {"parts": [{"text": (
             "Answer using Google Search results. Be factual and brief (under 120 words). "
             "Give dates and figures, and name your sources. Today is " + today + "."
-        ),
-        tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
-        temperature=0.2,
-        max_output_tokens=1200,
-    )
+        )}]},
+        "contents": [{"role": "user", "parts": [{"text": query}]}],
+        "tools": [{"google_search": {}}],
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1200},
+    }
 
     now = time.time()
-    for model in GEMINI_SEARCH_MODELS:
+    for model in list(dict.fromkeys(GEMINI_SEARCH_MODELS + [GEMINI_MODEL] + GEMINI_FALLBACK_MODELS)):
         if model in GEMINI_UNAVAILABLE or GEMINI_COOLDOWN.get(model, 0) > now:
             continue
         try:
-            resp = gemini_client().models.generate_content(
-                model=model, contents=query, config=config
-            )
-            text = (resp.text or "").strip()
+            data = gemini_request(model, payload)
+            candidates = data.get("candidates") or []
+            if not candidates:
+                continue
+            parts = (candidates[0].get("content") or {}).get("parts") or []
+            text = "".join(p.get("text", "") for p in parts if not p.get("thought")).strip()
             if not text:
                 continue
             sources = []
             try:
-                meta = resp.candidates[0].grounding_metadata
-                for chunk in (meta.grounding_chunks or [])[:4]:
-                    title = chunk.web.title
+                meta = candidates[0].get("groundingMetadata") or {}
+                for chunk in (meta.get("groundingChunks") or [])[:4]:
+                    title = (chunk.get("web") or {}).get("title")
                     if title and title not in sources:
                         sources.append(title)
             except Exception:
@@ -904,18 +959,22 @@ def health_ai():
         "gemini_model": GEMINI_MODEL,
         "web_search": web_search_enabled(),
         "groq_configured": bool(GROQ_API_KEY),
+        "gemini_last_error": LAST_GEMINI_ERROR[:300],
     }
-    # Set DEBUG_ERRORS=1 on Render to also run a live test call.
+    # Set DEBUG_ERRORS=1 on Render to also run live test calls.
     if gemini_enabled() and os.getenv("DEBUG_ERRORS", "") == "1":
         try:
-            r = gemini_client().models.generate_content(
-                model=GEMINI_MODEL, contents="Reply with the single word OK."
-            )
-            out["gemini_test"] = (r.text or "")[:40]
+            data = gemini_request(GEMINI_MODEL, {
+                "contents": [{"role": "user",
+                              "parts": [{"text": "Reply with the single word OK."}]}]
+            })
+            parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+            out["gemini_test"] = "".join(p.get("text", "") for p in parts)[:40]
         except Exception as exc:
-            out["gemini_test"] = "ERROR " + type(exc).__name__ + ": " + str(exc)[:300]
-    if web_search_enabled() and os.getenv("DEBUG_ERRORS", "") == "1":
-        out["search_test"] = run_web_search("What is today's date?")[:200]
+            out["gemini_test"] = "ERROR " + str(exc)[:300]
+        if web_search_enabled():
+            out["search_test"] = run_web_search("What is today's date?")[:200]
+            out["gemini_last_error"] = LAST_GEMINI_ERROR[:300]
     return out
 
 
